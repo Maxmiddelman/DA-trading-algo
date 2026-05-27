@@ -596,3 +596,6 @@ def solve_id3(req: SolveRequest):
 def solve_generic(req: SolveRequest):
     return solve_battery_dispatch(req)
 
+@app.post("/forecast")
+def forecast(req: SolveRequest):
+    return solve_battery_dispatch(req)
