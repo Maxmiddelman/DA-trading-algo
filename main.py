@@ -1,4 +1,4 @@
-from typing import List, Literal, Optional, Dict
+from typing import List, Literal, Optional, Dict, Tuple
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 from ortools.linear_solver import pywraplp
@@ -31,12 +31,50 @@ class Series(BaseModel):
     id2_price_eur_per_mwh: List[float]
     id3_price_eur_per_mwh: List[float]
 
+    # Optioneel: variabele netcapaciteit per kwartier in kW.
+    # Als leeg, gebruikt de solver site.max_import_kw / site.max_export_kw.
+    max_import_kw: List[float] = Field(default_factory=list)
+    max_export_kw: List[float] = Field(default_factory=list)
+
 
 class FutureConstraint(BaseModel):
     timestamp: str
     target_soc_kwh: Optional[float] = None
     min_soc_kwh: Optional[float] = None
     max_soc_kwh: Optional[float] = None
+
+
+class IntervalConstraint(BaseModel):
+    # Alle interval-constraints werken van start_timestamp inclusief
+    # tot end_timestamp exclusief: start <= t < end.
+    type: Literal[
+        "import_limit_kw",
+        "export_limit_kw",
+        "soc_target_kwh",
+        "soc_min_kwh",
+        "soc_max_kwh",
+        "battery_unavailable",
+        "max_charge_kw",
+        "max_discharge_kw",
+        "gopacs_import_reduction_kw",
+        "gopacs_export_reduction_kw",
+    ]
+
+    start_timestamp: str
+    end_timestamp: str
+
+    # Algemene waarde van de constraint.
+    # Voor import_limit_kw: max import in kW.
+    # Voor soc_target_kwh: target SOC in kWh.
+    # Voor gopacs_import_reduction_kw: reductie in kW.
+    value: Optional[float] = None
+
+    # Alleen voor GOPACS-reductieconstraints.
+    # Voorbeeld: baseline_kw=1000 en value=400 betekent max import/export = 600 kW.
+    baseline_kw: Optional[float] = None
+
+    priority: int = 100
+    description: Optional[str] = None
 
 
 class Options(BaseModel):
@@ -85,6 +123,10 @@ class SolveRequest(BaseModel):
     # Optionele constraints op specifieke toekomstige momenten
     future_constraints: List[FutureConstraint] = Field(default_factory=list)
 
+    # Interval constraints voor GOPACS, capaciteitsturingscontracten,
+    # onderhoud, batterijcalibratie, tijdelijke netlimieten, etc.
+    interval_constraints: List[IntervalConstraint] = Field(default_factory=list)
+
     options: Options = Options()
 
 
@@ -94,6 +136,14 @@ class SolveRequest(BaseModel):
 def pad(arr: List[float], n: int) -> List[float]:
     if len(arr) == 0:
         return [0.0] * n
+    if len(arr) < n:
+        return arr + [arr[-1]] * (n - len(arr))
+    return arr[:n]
+
+
+def pad_optional_series(arr: List[float], n: int, fallback: float) -> List[float]:
+    if len(arr) == 0:
+        return [fallback] * n
     if len(arr) < n:
         return arr + [arr[-1]] * (n - len(arr))
     return arr[:n]
@@ -124,6 +174,9 @@ def validate_and_pad(req: SolveRequest) -> None:
     req.series.id2_price_eur_per_mwh = pad(req.series.id2_price_eur_per_mwh, n)
     req.series.id3_price_eur_per_mwh = pad(req.series.id3_price_eur_per_mwh, n)
 
+    req.series.max_import_kw = pad_optional_series(req.series.max_import_kw, n, req.site.max_import_kw)
+    req.series.max_export_kw = pad_optional_series(req.series.max_export_kw, n, req.site.max_export_kw)
+
     if req.time_step_minutes <= 0:
         raise HTTPException(status_code=400, detail="time_step_minutes moet groter zijn dan 0.")
 
@@ -145,6 +198,14 @@ def validate_and_pad(req: SolveRequest) -> None:
     if req.site.max_import_kw < 0 or req.site.max_export_kw < 0:
         raise HTTPException(status_code=400, detail="max_import_kw en max_export_kw moeten >= 0 zijn.")
 
+    for i, value in enumerate(req.series.max_import_kw):
+        if value < 0:
+            raise HTTPException(status_code=400, detail=f"series.max_import_kw[{i}] mag niet negatief zijn.")
+
+    for i, value in enumerate(req.series.max_export_kw):
+        if value < 0:
+            raise HTTPException(status_code=400, detail=f"series.max_export_kw[{i}] mag niet negatief zijn.")
+
     parsed = [parse_timestamp(ts) for ts in req.series.timestamps]
     for i in range(1, len(parsed)):
         if parsed[i] <= parsed[i - 1]:
@@ -162,6 +223,14 @@ def validate_and_pad(req: SolveRequest) -> None:
             )
         )
 
+    # Controleer interval constraints vroegtijdig op basale invoerfouten.
+    for ic in req.interval_constraints:
+        if parse_timestamp(ic.end_timestamp) <= parse_timestamp(ic.start_timestamp):
+            raise HTTPException(
+                status_code=400,
+                detail=f"IntervalConstraint end_timestamp moet na start_timestamp liggen: {ic.description or ic.type}"
+            )
+
 
 def get_prices(req: SolveRequest) -> List[float]:
     if req.mode == "dayahead":
@@ -171,7 +240,7 @@ def get_prices(req: SolveRequest) -> List[float]:
     return req.series.id3_price_eur_per_mwh
 
 
-def derive_soc_bounds(capacity_kwh: float, dod: float) -> tuple[float, float]:
+def derive_soc_bounds(capacity_kwh: float, dod: float) -> Tuple[float, float]:
     """
     DoD 90% => 5% buffer onder en 5% buffer boven.
     Voorbeeld:
@@ -219,6 +288,70 @@ def timestamp_to_index(timestamps: List[str], target_timestamp: str) -> int:
     )
 
 
+def timestamp_range_to_indices(timestamps: List[str], start_timestamp: str, end_timestamp: str) -> List[int]:
+    start_dt = parse_timestamp(start_timestamp)
+    end_dt = parse_timestamp(end_timestamp)
+
+    if end_dt <= start_dt:
+        raise HTTPException(
+            status_code=400,
+            detail=f"end_timestamp moet na start_timestamp liggen: {start_timestamp} - {end_timestamp}"
+        )
+
+    parsed = [parse_timestamp(ts) for ts in timestamps]
+    indices = [i for i, dt in enumerate(parsed) if start_dt <= dt < end_dt]
+
+    if not indices:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Geen timestamps gevonden binnen interval {start_timestamp} - {end_timestamp}"
+        )
+
+    return indices
+
+
+def build_dynamic_grid_limits(req: SolveRequest, dt_hours: float) -> Tuple[List[float], List[float], List[float], List[float]]:
+    """
+    Retourneert:
+    - max_import_kw_series
+    - max_export_kw_series
+    - max_import_kwh_per_step
+    - max_export_kwh_per_step
+    """
+    n = req.horizon_steps
+
+    max_import_kw_series = pad_optional_series(req.series.max_import_kw, n, req.site.max_import_kw)
+    max_export_kw_series = pad_optional_series(req.series.max_export_kw, n, req.site.max_export_kw)
+
+    for i in range(n):
+        if max_import_kw_series[i] < 0:
+            raise HTTPException(status_code=400, detail=f"max_import_kw[{i}] mag niet negatief zijn.")
+        if max_export_kw_series[i] < 0:
+            raise HTTPException(status_code=400, detail=f"max_export_kw[{i}] mag niet negatief zijn.")
+
+    max_import_kwh_per_step = [kw * dt_hours for kw in max_import_kw_series]
+    max_export_kwh_per_step = [kw * dt_hours for kw in max_export_kw_series]
+
+    return (
+        max_import_kw_series,
+        max_export_kw_series,
+        max_import_kwh_per_step,
+        max_export_kwh_per_step,
+    )
+
+
+def require_value(ic: IntervalConstraint) -> float:
+    if ic.value is None:
+        raise HTTPException(status_code=400, detail=f"{ic.type} vereist value.")
+    return ic.value
+
+
+def require_baseline(ic: IntervalConstraint) -> float:
+    if ic.baseline_kw is None:
+        raise HTTPException(status_code=400, detail=f"{ic.type} vereist baseline_kw.")
+    return ic.baseline_kw
+
+
 # =========================
 # Core solver
 # =========================
@@ -231,8 +364,13 @@ def solve_battery_dispatch(req: SolveRequest):
     month_map = build_month_map(req.series.timestamps)
 
     max_step_energy = req.battery.power_kw * dt_hours
-    max_import_step = req.site.max_import_kw * dt_hours
-    max_export_step = req.site.max_export_kw * dt_hours
+
+    (
+        max_import_kw_series,
+        max_export_kw_series,
+        max_import_kwh_per_step,
+        max_export_kwh_per_step,
+    ) = build_dynamic_grid_limits(req, dt_hours)
 
     soc_min_kwh, soc_max_kwh = derive_soc_bounds(
         req.battery.capacity_kwh,
@@ -278,8 +416,16 @@ def solve_battery_dispatch(req: SolveRequest):
     # Decision vars
     charge = [solver.NumVar(0.0, max_step_energy, f"charge_{t}") for t in range(n)]
     discharge = [solver.NumVar(0.0, max_step_energy, f"discharge_{t}") for t in range(n)]
-    grid_import = [solver.NumVar(0.0, max_import_step, f"grid_import_{t}") for t in range(n)]
-    grid_export = [solver.NumVar(0.0, max_export_step, f"grid_export_{t}") for t in range(n)]
+
+    grid_import = [
+        solver.NumVar(0.0, max_import_kwh_per_step[t], f"grid_import_{t}")
+        for t in range(n)
+    ]
+    grid_export = [
+        solver.NumVar(0.0, max_export_kwh_per_step[t], f"grid_export_{t}")
+        for t in range(n)
+    ]
+
     soc = [solver.NumVar(soc_min_kwh, soc_max_kwh, f"soc_{t}") for t in range(n)]
 
     is_charging = [solver.IntVar(0, 1, f"is_charging_{t}") for t in range(n)]
@@ -302,8 +448,8 @@ def solve_battery_dispatch(req: SolveRequest):
             solver.Add(discharge[t] <= (1 - is_charging[t]) * max_step_energy)
 
         if req.options.enforce_no_simultaneous_import_export:
-            solver.Add(grid_import[t] <= is_importing[t] * max_import_step)
-            solver.Add(grid_export[t] <= (1 - is_importing[t]) * max_export_step)
+            solver.Add(grid_import[t] <= is_importing[t] * max_import_kwh_per_step[t])
+            solver.Add(grid_export[t] <= (1 - is_importing[t]) * max_export_kwh_per_step[t])
 
         # Energiebalans
         solver.Add(
@@ -330,7 +476,7 @@ def solve_battery_dispatch(req: SolveRequest):
     if req.options.final_soc_target_kwh is not None:
         solver.Add(soc[n - 1] == req.options.final_soc_target_kwh)
 
-    # Tijdsafhankelijke future constraints
+    # Tijdsafhankelijke future constraints op exacte timestamps
     for fc in req.future_constraints:
         idx = timestamp_to_index(req.series.timestamps, fc.timestamp)
 
@@ -343,11 +489,79 @@ def solve_battery_dispatch(req: SolveRequest):
         if fc.max_soc_kwh is not None:
             solver.Add(soc[idx] <= fc.max_soc_kwh)
 
+    # Interval constraints: GOPACS, capaciteitsturingscontracten,
+    # onderhoud, batterijcalibratie, tijdelijke netlimieten, etc.
+    applied_interval_constraints = []
+    for ic in req.interval_constraints:
+        indices = timestamp_range_to_indices(
+            req.series.timestamps,
+            ic.start_timestamp,
+            ic.end_timestamp
+        )
+
+        applied_interval_constraints.append({
+            "type": ic.type,
+            "start_timestamp": ic.start_timestamp,
+            "end_timestamp": ic.end_timestamp,
+            "value": ic.value,
+            "baseline_kw": ic.baseline_kw,
+            "steps": indices,
+            "description": ic.description,
+        })
+
+        for idx in indices:
+            if ic.type == "import_limit_kw":
+                value = require_value(ic)
+                solver.Add(grid_import[idx] <= value * dt_hours)
+
+            elif ic.type == "export_limit_kw":
+                value = require_value(ic)
+                solver.Add(grid_export[idx] <= value * dt_hours)
+
+            elif ic.type == "soc_target_kwh":
+                value = require_value(ic)
+                solver.Add(soc[idx] == value)
+
+            elif ic.type == "soc_min_kwh":
+                value = require_value(ic)
+                solver.Add(soc[idx] >= value)
+
+            elif ic.type == "soc_max_kwh":
+                value = require_value(ic)
+                solver.Add(soc[idx] <= value)
+
+            elif ic.type == "battery_unavailable":
+                solver.Add(charge[idx] == 0.0)
+                solver.Add(discharge[idx] == 0.0)
+
+            elif ic.type == "max_charge_kw":
+                value = require_value(ic)
+                solver.Add(charge[idx] <= value * dt_hours)
+
+            elif ic.type == "max_discharge_kw":
+                value = require_value(ic)
+                solver.Add(discharge[idx] <= value * dt_hours)
+
+            elif ic.type == "gopacs_import_reduction_kw":
+                value = require_value(ic)
+                baseline_kw = require_baseline(ic)
+                max_allowed_import_kw = max(baseline_kw - value, 0.0)
+                solver.Add(grid_import[idx] <= max_allowed_import_kw * dt_hours)
+
+            elif ic.type == "gopacs_export_reduction_kw":
+                value = require_value(ic)
+                baseline_kw = require_baseline(ic)
+                max_allowed_export_kw = max(baseline_kw - value, 0.0)
+                solver.Add(grid_export[idx] <= max_allowed_export_kw * dt_hours)
+
     kw_max_cost_terms = []
     if req.options.include_kw_max:
         free_threshold = req.options.kw_max_free_threshold_kw
         mid_threshold = req.options.kw_max_mid_threshold_kw
         mid_band_width = mid_threshold - free_threshold
+
+        if mid_band_width < 0:
+            raise HTTPException(status_code=400, detail="kw_max_mid_threshold_kw moet groter zijn dan kw_max_free_threshold_kw.")
 
         for month_key in month_map.keys():
             monthly_peak_kw = monthly_peak_kw_vars[month_key]
@@ -402,7 +616,8 @@ def solve_battery_dispatch(req: SolveRequest):
         return {
             "status": result_status,
             "solver_backend": used_backend,
-            "message": "Geen bruikbare oplossing gevonden."
+            "message": "Geen bruikbare oplossing gevonden. Controleer vooral SOC-targets, GOPACS-constraints, netlimieten en DoD-grenzen.",
+            "applied_interval_constraints": applied_interval_constraints,
         }
 
     schedule = []
@@ -455,11 +670,16 @@ def solve_battery_dispatch(req: SolveRequest):
             "price_eur_per_mwh": round(prices_eur_per_mwh[t], 6),
             "load_kwh": round(load[t], 6),
             "pv_kwh": round(pv[t], 6),
+            "max_import_kw": round(max_import_kw_series[t], 6),
+            "max_export_kw": round(max_export_kw_series[t], 6),
             "charge_kwh": round(charge_val, 6),
             "discharge_kwh": round(discharge_val, 6),
+            "charge_kw_avg": round(charge_val / dt_hours, 6),
+            "discharge_kw_avg": round(discharge_val / dt_hours, 6),
             "import_kwh": round(import_val, 6),
             "export_kwh": round(export_val, 6),
             "import_kw_avg": round(import_val / dt_hours, 6),
+            "export_kw_avg": round(export_val / dt_hours, 6),
             "soc_end_kwh": round(soc_val, 6),
             "is_charging": int(round(is_charging[t].solution_value())),
             "is_importing": int(round(is_importing[t].solution_value())),
@@ -526,13 +746,17 @@ def solve_battery_dispatch(req: SolveRequest):
             "mloea": req.options.mloea,
             "final_soc_target_kwh": req.options.final_soc_target_kwh,
             "max_step_energy_kwh": round(max_step_energy, 6),
-            "max_import_step_kwh": round(max_import_step, 6),
-            "max_export_step_kwh": round(max_export_step, 6),
+            "dynamic_grid_limits": True,
+            "max_import_kw_min": round(min(max_import_kw_series), 6),
+            "max_import_kw_max": round(max(max_import_kw_series), 6),
+            "max_export_kw_min": round(min(max_export_kw_series), 6),
+            "max_export_kw_max": round(max(max_export_kw_series), 6),
             "include_kw_max": req.options.include_kw_max,
             "kw_max_free_threshold_kw": req.options.kw_max_free_threshold_kw,
             "kw_max_mid_threshold_kw": req.options.kw_max_mid_threshold_kw,
             "kw_max_mid_tariff_eur_per_kw": req.options.kw_max_mid_tariff_eur_per_kw,
-            "kw_max_high_tariff_eur_per_kw": req.options.kw_max_high_tariff_eur_per_kw
+            "kw_max_high_tariff_eur_per_kw": req.options.kw_max_high_tariff_eur_per_kw,
+            "interval_constraints_count": len(req.interval_constraints),
         },
         "summary": {
             "total_import_kwh": round(total_import_kwh, 6),
@@ -559,6 +783,7 @@ def solve_battery_dispatch(req: SolveRequest):
             )
         },
         "monthly_kw_max": monthly_kw_max_summary,
+        "applied_interval_constraints": applied_interval_constraints,
         "schedule": schedule
     }
 
@@ -596,6 +821,8 @@ def solve_id3(req: SolveRequest):
 def solve_generic(req: SolveRequest):
     return solve_battery_dispatch(req)
 
+
 @app.post("/forecast")
 def forecast(req: SolveRequest):
     return solve_battery_dispatch(req)
+
