@@ -1,0 +1,17 @@
+Physical main-meter programs and PV curtailment
+
+main_meter_program_kw optionally specifies an exact net-grid target for every delivery slot. Positive means import, negative means export; null leaves a slot unconstrained by the program. A zero target may require PV curtailment even when the physical export connection has spare capacity. This is distinct from a commercial day-ahead position.
+
+PV curtailment is an explicit bounded variable in the energy balance. Responses expose pv_curtail_kwh and pv_curtail_kw_avg. SOC transitions retain sqrt(round-trip-efficiency) on each direction. Optional min_soc_pct and max_soc_pct override the legacy DoD-derived bounds; unspecified bounds retain the legacy behaviour.
+
+Required horizon series must be complete, finite and aligned to unique, contiguous timezone-aware timestamps. Missing values are no longer silently fabricated. Infeasible physical programs return infeasible instead of being rewritten. Existing day-ahead/ID2/ID3 endpoints remain; this change does not add an imbalance-trading endpoint.
+
+Optional terminal_soc_value_eur_per_kwh and grid_slew_cost_eur_per_kw default to zero. Setpoint movement can include previous_grid_kw. These are objective adjustments, separately reported in objective_adjustments; they do not change reported realised energy costs or override a hard terminal SOC target. Tune them before enabling. Solver duration defaults to 30 seconds, configurable from 100 to 180000 ms.
+
+Tests
+python -m pip install -r tests/requirements.txt
+python -m pytest -q tests
+
+Eight regression cases cover zero-program economic curtailment, free export, energy/SOC balance, infeasible programs, missing/non-finite/duplicate/naive inputs and hard terminal target priority.
+
+Deployment must be coordinated with consumers that enforce explicit SOC bounds and consume the curtailment fields. Validate the deployed service in staging before live rollout. This repository change alone does not update any dashboard, database or EMS schedule.
