@@ -78,6 +78,13 @@ class IntervalConstraint(BaseModel):
 
 
 class Options(BaseModel):
+    min_soc_pct: Optional[float] = Field(default=None, ge=0, le=100)
+    max_soc_pct: Optional[float] = Field(default=None, ge=0, le=100)
+    terminal_soc_value_eur_per_kwh: float = Field(default=0.0, ge=0, allow_inf_nan=False)
+    grid_slew_cost_eur_per_kw: float = Field(default=0.0, ge=0, allow_inf_nan=False)
+    previous_grid_kw: Optional[float] = Field(default=None, allow_inf_nan=False)
+    solver_time_limit_ms: int = Field(default=30000, ge=100, le=180000)
+
     final_soc_target_kwh: Optional[float] = None
 
     enforce_no_simultaneous_charge_discharge: bool = True
@@ -119,6 +126,8 @@ class SolveRequest(BaseModel):
     battery: Battery
     site: Site
     series: Series
+    # Physical net-meter targets; None leaves a slot economically optimisable.
+    main_meter_program_kw: List[Optional[float]] = Field(default_factory=list)
 
     # Optionele constraints op specifieke toekomstige momenten
     future_constraints: List[FutureConstraint] = Field(default_factory=list)
@@ -166,6 +175,26 @@ def parse_timestamp(ts: str) -> datetime:
 
 def validate_and_pad(req: SolveRequest) -> None:
     n = req.horizon_steps
+    required = (req.series.timestamps, req.series.load_kwh, req.series.pv_kwh,
+                req.series.da_price_eur_per_mwh, req.series.id2_price_eur_per_mwh,
+                req.series.id3_price_eur_per_mwh)
+    if n <= 0 or any(len(values) != n for values in required):
+        raise HTTPException(status_code=400, detail="Required horizon series must be complete")
+    if any(not math.isfinite(v) for values in required[1:] for v in values):
+        raise HTTPException(status_code=400, detail="Non-finite horizon input")
+    if any(v < 0 for v in req.series.pv_kwh + req.series.load_kwh):
+        raise HTTPException(status_code=400, detail="Negative PV/load input")
+    parsed = [parse_timestamp(t) for t in req.series.timestamps]
+    if any(t.tzinfo is None for t in parsed) or any(
+        (parsed[i]-parsed[i-1]).total_seconds() != req.time_step_minutes*60 for i in range(1,n)):
+        raise HTTPException(status_code=400, detail="Expected contiguous timezone-aware delivery slots")
+    if req.main_meter_program_kw and (len(req.main_meter_program_kw) != n or
+            any(v is not None and not math.isfinite(v) for v in req.main_meter_program_kw)):
+        raise HTTPException(status_code=400, detail="Invalid physical main-meter program")
+    scalars = [req.actual_soc_kwh, req.battery.power_kw, req.battery.capacity_kwh,
+               req.site.max_import_kw, req.site.max_export_kw]
+    if not all(math.isfinite(v) for v in scalars):
+        raise HTTPException(status_code=400, detail="Non-finite physical input")
 
     req.series.timestamps = pad_timestamps(req.series.timestamps, n)
     req.series.load_kwh = pad(req.series.load_kwh, n)
@@ -377,6 +406,13 @@ def solve_battery_dispatch(req: SolveRequest):
         req.options.dod
     )
 
+    if req.options.min_soc_pct is not None:
+        soc_min_kwh = req.battery.capacity_kwh * req.options.min_soc_pct / 100
+    if req.options.max_soc_pct is not None:
+        soc_max_kwh = req.battery.capacity_kwh * req.options.max_soc_pct / 100
+    if soc_min_kwh > soc_max_kwh:
+        raise HTTPException(status_code=400, detail="Inverted SOC bounds")
+
     if not (soc_min_kwh <= req.actual_soc_kwh <= soc_max_kwh):
         raise HTTPException(
             status_code=400,
@@ -412,6 +448,7 @@ def solve_battery_dispatch(req: SolveRequest):
 
     solver = choose_solver(req.options.solver_backend)
     used_backend = solver.SolverVersion()
+    solver.SetTimeLimit(req.options.solver_time_limit_ms)
 
     # Decision vars
     charge = [solver.NumVar(0.0, max_step_energy, f"charge_{t}") for t in range(n)]
@@ -425,6 +462,8 @@ def solve_battery_dispatch(req: SolveRequest):
         solver.NumVar(0.0, max_export_kwh_per_step[t], f"grid_export_{t}")
         for t in range(n)
     ]
+
+    curtailed_pv = [solver.NumVar(0.0, pv[t], f"curtailed_pv_{t}") for t in range(n)]
 
     soc = [solver.NumVar(soc_min_kwh, soc_max_kwh, f"soc_{t}") for t in range(n)]
 
@@ -453,8 +492,11 @@ def solve_battery_dispatch(req: SolveRequest):
 
         # Energiebalans
         solver.Add(
-            grid_import[t] + discharge[t] + pv[t] == load[t] + charge[t] + grid_export[t]
+            grid_import[t] + discharge[t] + pv[t] - curtailed_pv[t] == load[t] + charge[t] + grid_export[t]
         )
+
+        if req.main_meter_program_kw and req.main_meter_program_kw[t] is not None:
+            solver.Add(grid_import[t] - grid_export[t] == req.main_meter_program_kw[t] * dt_hours)
 
         # Rolling horizon start vanuit actuele SOC op optimization_timestamp
         if t == 0:
@@ -598,7 +640,18 @@ def solve_battery_dispatch(req: SolveRequest):
     # kW-max kosten
     kw_max_cost_expr = solver.Sum(kw_max_cost_terms) if kw_max_cost_terms else 0.0
 
-    solver.Minimize(energy_cost_expr + kw_max_cost_expr)
+    movement = []
+    for t in range(n):
+        previous = req.options.previous_grid_kw if t == 0 else (grid_import[t-1]-grid_export[t-1])/dt_hours
+        if previous is not None and req.options.grid_slew_cost_eur_per_kw > 0:
+            delta = solver.NumVar(0, solver.infinity(), f"grid_movement_{t}")
+            current = (grid_import[t]-grid_export[t])/dt_hours
+            solver.Add(delta >= current-previous)
+            solver.Add(delta >= previous-current)
+            movement.append(delta)
+    stability_cost = solver.Sum(movement) * req.options.grid_slew_cost_eur_per_kw
+    terminal_credit = soc[n-1] * req.options.terminal_soc_value_eur_per_kwh
+    solver.Minimize(energy_cost_expr + kw_max_cost_expr + stability_cost - terminal_credit)
 
     status = solver.Solve()
 
@@ -678,6 +731,8 @@ def solve_battery_dispatch(req: SolveRequest):
             "discharge_kw_avg": round(discharge_val / dt_hours, 6),
             "import_kwh": round(import_val, 6),
             "export_kwh": round(export_val, 6),
+            "pv_curtail_kwh": round(curtailed_pv[t].solution_value(), 6),
+            "pv_curtail_kw_avg": round(curtailed_pv[t].solution_value() / dt_hours, 6),
             "import_kw_avg": round(import_val / dt_hours, 6),
             "export_kw_avg": round(export_val / dt_hours, 6),
             "soc_end_kwh": round(soc_val, 6),
@@ -726,6 +781,10 @@ def solve_battery_dispatch(req: SolveRequest):
         "status": result_status,
         "solver_backend": used_backend,
         "objective_value_eur": round(solver.Objective().Value(), 6),
+        "objective_adjustments": {
+            "setpoint_movement_cost_eur": round(sum(v.solution_value() for v in movement) * req.options.grid_slew_cost_eur_per_kw, 6),
+            "terminal_energy_credit_eur": round(soc[-1].solution_value() * req.options.terminal_soc_value_eur_per_kwh, 6),
+        },
         "parameters": {
             "mode": req.mode,
             "optimization_timestamp": req.optimization_timestamp,
@@ -793,7 +852,7 @@ def solve_battery_dispatch(req: SolveRequest):
 # =========================
 @app.get("/health")
 def health():
-    return {"ok": True}
+    return {"ok": True, "capabilities": ["physical_main_meter_program_v1", "pv_curtailment", "explicit_soc_bounds"]}
 
 
 @app.post("/solve/dayahead")
@@ -825,4 +884,5 @@ def solve_generic(req: SolveRequest):
 @app.post("/forecast")
 def forecast(req: SolveRequest):
     return solve_battery_dispatch(req)
+
 

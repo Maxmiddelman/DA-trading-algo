@@ -1,0 +1,3 @@
+fastapi==0.115.6
+ortools==9.10.4067
+pytest==9.1.1
